@@ -22,5 +22,5 @@
   <h1>
     Hey There <img src="https://media.giphy.com/media/hvRJCLFzcasrR4ia7z/giphy.gif" width="24" />
   </h1>
-  <p style="font-family: 'Lucida Console'">Let's connect and build something awesome</p>
+  <p style="font-family: 'Lucida Console'; font-size: '20px'">Let's connect and build something <strong>creative</strong></p>
 </div>
