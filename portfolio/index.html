@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Shashank Sharma · geekyorion</title>
+  <meta name="description" content="Shashank Sharma (geekyorion): front-end engineer, micro-frontend architect and creative coder. A portfolio rendered as a 90k-particle face on a hand-written WebGPU / WebGL2 engine." />
+  <meta name="theme-color" content="#05070d" />
+  <meta property="og:title" content="Shashank Sharma · geekyorion" />
+  <meta property="og:description" content="A portfolio made of particles. Move your cursor, make it smile." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2305070d'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='700' text-anchor='middle' fill='%2335e0ff'%3E%3C/%3E%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <a class="skip" href="#whoami">Skip to content</a>
+  <canvas id="gl" aria-hidden="true"></canvas>
+  <div class="grid-bg" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#hero" aria-label="Home"><span class="prompt">geekyorion@portfolio</span><span class="dim">:~$</span><span class="caret"></span></a>
+    <nav aria-label="Sections">
+      <a href="#whoami"><span class="dim">01.</span>whoami</a>
+      <a href="#experience"><span class="dim">02.</span>git log</a>
+      <a href="#projects"><span class="dim">03.</span>projects</a>
+      <a href="#stack"><span class="dim">04.</span>stack</a>
+      <a href="#contact"><span class="dim">05.</span>contact</a>
+    </nav>
+    <div class="hud" id="hud" aria-live="off">
+      <span id="hud-backend">booting…</span>
+      <span id="hud-count"></span>
+      <span id="hud-fps"></span>
+    </div>
+  </header>
+
+  <main>
+    <section id="hero" class="section hero" data-section="hero">
+      <div class="col">
+        <p class="kicker mono">// hello, world</p>
+        <h1>Shashank<br /><span class="grad">Sharma</span></h1>
+        <p class="lede">
+          <span class="mono typed" id="typed" aria-label="Front-end engineer, micro-frontend architect, creative coder">front-end engineer</span><br />
+          I build modular, high-performance interfaces, and sometimes I make particles smile.
+        </p>
+        <ul class="hints mono" aria-label="Interaction hints">
+          <li><kbd>move</kbd> repel the particles</li>
+          <li><kbd>click</kbd> send a shockwave</li>
+          <li><kbd>1-9</kbd> change my expression</li>
+          <li><kbd>`</kbd> open the terminal</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="whoami" class="section" data-section="whoami">
+      <div class="col">
+        <h2 class="mono"><span class="dim">$</span> whoami</h2>
+        <div class="panel code" id="whoami-code"></div>
+        <p class="note" id="bio"></p>
+      </div>
+    </section>
+
+    <section id="experience" class="section" data-section="experience">
+      <div class="col wide">
+        <h2 class="mono"><span class="dim">$</span> git log --graph --oneline <span class="dim">career</span></h2>
+        <ol class="gitlog" id="gitlog"></ol>
+      </div>
+    </section>
+
+    <section id="projects" class="section" data-section="projects">
+      <div class="col wide">
+        <h2 class="mono"><span class="dim">$</span> ls ~/projects <span class="dim">--sort=impact</span></h2>
+        <div class="projects" id="project-list"></div>
+      </div>
+    </section>
+
+    <section id="stack" class="section" data-section="stack">
+      <div class="col">
+        <h2 class="mono"><span class="dim">$</span> cat stack.json</h2>
+        <div class="panel" id="stack-list"></div>
+        <div class="two">
+          <div class="panel small"><h3 class="mono">awards</h3><ul id="awards"></ul></div>
+          <div class="panel small"><h3 class="mono">certs</h3><ul id="certs"></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="contact" class="section" data-section="contact">
+      <div class="col">
+        <h2 class="mono"><span class="dim">$</span> npx geekyorion</h2>
+        <div class="panel card mono" id="npx-card"></div>
+        <p class="note">Let's connect and build something <strong>creative</strong>.</p>
+      </div>
+    </section>
+
+    <footer class="foot mono">
+      <span>© <span id="year"></span> Shashank Sharma</span>
+      <span class="dim">hand-written WebGPU + WebGL2 engine · no three.js · <span id="foot-backend"></span></span>
+    </footer>
+  </main>
+
+  <div class="dock" role="toolbar" aria-label="Face controls">
+    <div class="expr" id="expr-buttons"></div>
+    <div class="dock-row">
+      <button class="chip" id="btn-theme" type="button" title="Cycle colour theme (T)">theme</button>
+      <button class="chip" id="btn-mirror" type="button" title="Drive my face with your webcam (on-device)">mirror me</button>
+      <button class="chip accent" id="btn-term" type="button" title="Open terminal (`)">&gt;_ terminal</button>
+    </div>
+  </div>
+
+  <div class="term" id="term" role="dialog" aria-modal="false" aria-label="Terminal" hidden>
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span><span class="mono dim">guest@geekyorion: ~</span><button class="term-close" id="term-close" aria-label="Close terminal">×</button></div>
+    <div class="term-out mono" id="term-out" aria-live="polite"></div>
+    <label class="term-in mono"><span class="ps1">❯</span><input id="term-input" autocomplete="off" spellcheck="false" aria-label="Terminal input" /></label>
+  </div>
+
+  <video id="cam" playsinline muted hidden></video>
+  <div class="toast mono" id="toast" role="status"></div>
+
+  <noscript><div class="panel" style="margin:20vh auto;max-width:520px">This portfolio renders with WebGPU/WebGL. Please enable JavaScript, or visit <a href="https://geekyorion.github.io/resume">my resume</a>.</div></noscript>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

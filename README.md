@@ -23,4 +23,8 @@
     Hey There <img src="https://media.giphy.com/media/hvRJCLFzcasrR4ia7z/giphy.gif" width="24" />
   </h1>
   <p style="font-family: 'Lucida Console'; font-size: '20px'">Let's connect and build something <strong>creative</strong></p>
+  <p>
+    <a href="https://geekyorion.github.io/geekyorion/"><strong>▶ Interactive portfolio</strong></a>:
+    my face as 100k GPU particles on a hand-written WebGPU / WebGL2 engine (<a href="./portfolio">source</a>)
+  </p>
 </div>
