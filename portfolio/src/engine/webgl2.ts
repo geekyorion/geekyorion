@@ -21,6 +21,7 @@ layout(std140) uniform Uniforms {
   vec4 colA;
   vec4 colB;
   vec4 weights[3];
+  vec4 style;
 } u;
 
 float hash(uint i) {
@@ -78,6 +79,7 @@ void main() {
   if (i >= int(u.sim2.z)) { oPos = vec4(0.0); oVel = vec4(0.0); return; }
 
   vec4 b = texelFetch(uBase, tc, 0);
+  float hw = mix(b.w, 1.0, u.style.x);
   vec3 p = b.xyz;
   for (int k = 0; k < ${SHAPES}; k++) {
     float w = u.weights[k / 4][k % 4];
@@ -87,7 +89,7 @@ void main() {
       p += vec3(unpackHalf2x16(d.x), unpackHalf2x16(d.y).x) * w;
     }
   }
-  p = rotateHead(p, u.head.x * b.w, u.head.y * b.w, u.head.z * b.w);
+  p = rotateHead(p, u.head.x * hw, u.head.y * hw, u.head.z * hw);
   vec3 faceT = p * u.faceXf.w + u.faceXf.xyz;
 
   vec3 m = texelFetch(uMorph, tc, 0).xyz;
@@ -160,10 +162,14 @@ void main() {
   vec3 col = mix(shapeCol, faceCol, faceMix);
   col += u.colB.rgb * min(length(V) * 0.12, 0.9);
   col *= u.colB.w;
-  vCol = vec4(col, mix(1.0, c.a, faceMix));
+  float bw = texelFetch(uBase, tc, 0).w;
+  float dotA = max(c.a, min(length(V) * 0.3, 0.85));
+  vCol = vec4(col, mix(1.0, mix(c.a, dotA, u.style.x), faceMix));
+  if (vCol.a < 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
 
   vec4 clip = u.viewProj * vec4(P, 1.0);
-  float px = max(u.sim2.w * (0.7 + seed * 0.6) * u.view.z * u.view.y * 0.5 / clip.w, 0.9);
+  float sizeK = mix(0.7 + seed * 0.6, mix(1.0, bw * u.style.y, faceMix), u.style.x);
+  float px = max(u.sim2.w * sizeK * u.view.z * u.view.y * 0.5 / clip.w, 0.9);
   px = min(px, 7.0 * u.view.y / 900.0);
   gl_Position = clip;
   gl_PointSize = px * 2.0;
@@ -277,6 +283,21 @@ export function createWebGL2Engine(canvas: HTMLCanvasElement, data: ParticleData
       pixels.set(target.subarray(0, pixels.length));
       gl.bindTexture(gl.TEXTURE_2D, morphTex);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, pixels);
+    },
+    setFace(face) {
+      const pad = (src: Float32Array) => {
+        const out = new Float32Array(W * H * 4);
+        out.set(src.subarray(0, out.length));
+        return out;
+      };
+      gl.bindTexture(gl.TEXTURE_2D, baseTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, pad(face.base));
+      gl.bindTexture(gl.TEXTURE_2D, colorTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, pad(face.color));
+      const d = new Uint32Array(DW * DH * 2);
+      d.set(face.deltas);
+      gl.bindTexture(gl.TEXTURE_2D, deltaTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, DW, DH, gl.RG_INTEGER, gl.UNSIGNED_INT, d);
     },
     resize(w, h) {
       canvas.width = w;

@@ -10,6 +10,8 @@ export interface TermAPI {
   shape(name: ShapeName): void;
   face(): void;
   theme(name?: string): string;
+  faceStyle(style?: string): string;
+  faceStyles: string[];
   themes: string[];
   explode(): void;
   mirror(on: boolean): Promise<void>;
@@ -114,6 +116,13 @@ export class Terminal {
           if (!SHAPES.includes(name as ShapeName)) return [['err', `shapes: ${SHAPES.join(', ')}`]];
           this.api.shape(name as ShapeName);
           return [['ok', `particles → ${name}`]];
+        },
+      },
+      style: {
+        help: `style [${this.api.faceStyles.join('|')}]: switch face style`,
+        run: ([name]) => {
+          if (name && !this.api.faceStyles.includes(name)) return [['err', `styles: ${this.api.faceStyles.join(', ')}`]];
+          return [['ok', `face style: ${this.api.faceStyle(name)}`]];
         },
       },
       theme: {

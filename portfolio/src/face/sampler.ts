@@ -28,21 +28,26 @@ function toHalf(v: number) {
 }
 const pack = (a: number, b: number) => (toHalf(a) | (toHalf(b) << 16)) >>> 0;
 
-/** Synthetic depth (world units) for a pixel of the portrait. */
-function depth(u: number, v: number, lum: number) {
-  const dx = (u - 512) / 215;
-  const dy = (v - 440) / 300;
-  const e = 1 - dx * dx - dy * dy;
-  let head = e > 0 ? 0.62 * Math.sqrt(e) : 0;
+/** Relief of the facial features (nose, sockets, lips, chin) in world units. */
+function features(u: number, v: number, lum: number) {
   const faceMask = smooth(300, 330, u) * (1 - smooth(694, 724, u)) * (1 - smooth(640, 700, v));
-  head +=
+  return (
     faceMask *
     (0.2 * gauss(u - 512, v - 440, 26, 70) +
       0.08 * gauss(u - LM.noseTip.x, v - LM.noseTip.y, 24, 18) -
       0.07 * (gauss(u - LM.eyeL.x, v - LM.eyeL.y, 40, 24) + gauss(u - LM.eyeR.x, v - LM.eyeR.y, 40, 24)) +
       0.05 * gauss(u - 512, v - 560, 70, 28) +
       0.04 * gauss(u - 512, v - 662, 60, 30) +
-      (lum - 0.5) * 0.02);
+      (lum - 0.5) * 0.02)
+  );
+}
+
+/** Synthetic depth (world units) for a pixel of the portrait. */
+function depth(u: number, v: number, lum: number) {
+  const dx = (u - 512) / 215;
+  const dy = (v - 440) / 300;
+  const e = 1 - dx * dx - dy * dy;
+  const head = (e > 0 ? 0.62 * Math.sqrt(e) : 0) + features(u, v, lum);
   const nx = (u - 512) / 150;
   const neck = v > 560 ? 0.34 * Math.sqrt(Math.max(0, 1 - nx * nx)) - 0.06 : 0;
   const sx = (u - 512) / 520;
@@ -133,11 +138,16 @@ export interface FaceOptions {
   count: number;
 }
 
-/**
- * Importance-samples the portrait into particles: more particles on edges
- * (eyes, brows, lips, hair strands), fewer on flat skin, none on background.
- */
-export async function sampleFace(url: string, opts: FaceOptions): Promise<ParticleData> {
+export interface Portrait {
+  S: number;
+  scale: number;
+  px: Uint8ClampedArray;
+  lum: Float32Array;
+  bg: Uint8Array;
+}
+
+/** Decode the portrait once; both face styles sample from it. */
+export async function loadPortrait(url: string): Promise<Portrait> {
   const img = new Image();
   img.src = url;
   await img.decode();
@@ -171,7 +181,37 @@ export async function sampleFace(url: string, opts: FaceOptions): Promise<Partic
     if (y > 0) stack.push(i - S);
     if (y < S - 1) stack.push(i + S);
   }
+  return { S, scale, px, lum, bg };
+}
 
+/** Lift shadows so dark hair still reads on a dark background. */
+const lift = (c: number) => Math.pow(c / 255, 0.8) * 0.92 + 0.05;
+
+function writeDeltas(deltas: Uint32Array, p: number, bs: Float32Array) {
+  for (let k = 0; k < SHAPES; k++) {
+    const o = (p * SHAPES + k) * 2;
+    deltas[o] = pack(bs[k * 3] * PX, -bs[k * 3 + 1] * PX);
+    deltas[o + 1] = pack(bs[k * 3 + 2] * PX, 0);
+  }
+}
+
+/** Intro: particles start on a wide, flat galaxy disc. */
+function galaxy(n: number) {
+  const start = new Float32Array(n * 4);
+  for (let p = 0; p < n; p++) {
+    const a = Math.random() * Math.PI * 2;
+    const rad = 2.5 + Math.random() * 5;
+    start.set([Math.cos(a) * rad, (Math.random() - 0.5) * 0.6, Math.sin(a) * rad - 2, 1], p * 4);
+  }
+  return start;
+}
+
+/**
+ * Photo style. Importance-samples the portrait into particles: more particles on edges
+ * (eyes, brows, lips, hair strands), fewer on flat skin, none on background.
+ */
+export function sampleFace(portrait: Portrait, opts: FaceOptions): ParticleData {
+  const { S, scale, px, lum, bg } = portrait;
   // importance weights
   const weight = new Float32Array(S * S);
   let total = 0;
@@ -201,7 +241,7 @@ export async function sampleFace(url: string, opts: FaceOptions): Promise<Partic
   const base = new Float32Array(n * 4);
   const color = new Float32Array(n * 4);
   const deltas = new Uint32Array(n * SHAPES * 2);
-  const start = new Float32Array(n * 4);
+  const start = galaxy(n);
   const bs = new Float32Array(SHAPES * 3);
 
   for (let p = 0; p < n; p++) {
@@ -226,28 +266,97 @@ export async function sampleFace(url: string, opts: FaceOptions): Promise<Partic
     base[p * 4 + 2] = z;
     base[p * 4 + 3] = 1 - smooth(650, 790, v);
 
-    // lift shadows so dark hair still reads on a dark background
-    const lift = (c: number) => Math.pow(c / 255, 0.8) * 0.92 + 0.05;
     color[p * 4] = lift(px[i * 4]);
     color[p * 4 + 1] = lift(px[i * 4 + 1]);
     color[p * 4 + 2] = lift(px[i * 4 + 2]);
     color[p * 4 + 3] = (1 - smooth(700, 860, v)) * 0.95;
 
     blendshapes(u, v, bs);
-    for (let k = 0; k < SHAPES; k++) {
-      const o = (p * SHAPES + k) * 2;
-      deltas[o] = pack(bs[k * 3] * PX, -bs[k * 3 + 1] * PX);
-      deltas[o + 1] = pack(bs[k * 3 + 2] * PX, 0);
-    }
-
-    // intro: particles start on a wide, flat galaxy disc
-    const a = Math.random() * Math.PI * 2;
-    const rad = 2.5 + Math.random() * 5;
-    start[p * 4] = Math.cos(a) * rad;
-    start[p * 4 + 1] = (Math.random() - 0.5) * 0.6;
-    start[p * 4 + 2] = Math.sin(a) * rad - 2;
-    start[p * 4 + 3] = 1;
+    writeDeltas(deltas, p, bs);
   }
 
   return { count: n, base, color, deltas, start };
+}
+
+export interface SphereOptions extends FaceOptions {
+  /** Number of dots on the whole sphere (the face covers the front half). */
+  dots: number;
+}
+
+/**
+ * Sphere style: the portrait is projected onto a 3D ellipsoidal head covered in
+ * evenly spaced dots (a Fibonacci lattice), halftone-sized by brightness. The
+ * back of the sphere keeps faint "shell" dots so it reads as a globe.
+ *
+ * base.w carries the dot size here (the whole sphere turns as one head).
+ * Particles beyond `dots` are parked on real dots with alpha 0: invisible at
+ * rest, they only show up once the pointer scatters the face.
+ */
+export function sampleSphereFace(portrait: Portrait, opts: SphereOptions): ParticleData {
+  const { S, scale, px, lum, bg } = portrait;
+  const n = opts.count;
+  const M = Math.min(opts.dots, n);
+  // ellipsoid in portrait pixels: centre + radii; depth radius in world units
+  const cu = 512, cv = 425, ru = 238, rv = 318, rz = 0.78;
+  const golden = Math.PI * (3 - Math.sqrt(5));
+
+  const base = new Float32Array(n * 4);
+  const color = new Float32Array(n * 4);
+  const deltas = new Uint32Array(n * SHAPES * 2);
+  const bs = new Float32Array(SHAPES * 3);
+  const shell = [0.32, 0.42, 0.6];
+
+  for (let p = 0; p < M; p++) {
+    const y = 1 - (p / (M - 1)) * 2;
+    const r = Math.sqrt(1 - y * y);
+    const th = golden * p;
+    const x = Math.cos(th) * r;
+    const z = Math.sin(th) * r;
+    const u = cu + x * ru;
+    const v = cv - y * rv;
+
+    let wz = z * rz - 0.3;
+    let size = 0.5;
+    let rgb = shell;
+    let alpha = z > 0 ? 0.32 : 0.16;
+    bs.fill(0);
+
+    if (z > 0) {
+      const ix = Math.min(S - 1, Math.max(0, Math.round(u / scale)));
+      const iy = Math.min(S - 1, Math.max(0, Math.round(v / scale)));
+      const i = iy * S + ix;
+      const fade = 1 - smooth(640, 740, v);
+      const sat = Math.max(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]) - Math.min(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]);
+      const whitish = lum[i] > 0.68 && sat < 38;
+      if (!bg[i] && !whitish && fade > 0.02) {
+        const l = lum[i];
+        // features push out along the surface, strongest facing the camera
+        wz += features(u, v, l) * z * 1.3;
+        rgb = [lift(px[i * 4]), lift(px[i * 4 + 1]), lift(px[i * 4 + 2])];
+        // halftone: bright skin -> big dots, dark eyes/brows/hair -> small dots, so the gaps draw the features
+        const t = smooth(0.12, 0.72, l);
+        size = (0.36 + 1.38 * t) * (0.65 + 0.35 * z);
+        // dark regions (hair, brows) get a cool slate tint so the hairline still reads
+        const dark = 1 - smooth(0.05, 0.3, l);
+        rgb = rgb.map((c, k) => (c * (0.75 + 0.5 * t)) * (1 - dark * 0.7) + [0.34, 0.42, 0.58][k] * dark * 0.7);
+        alpha = 0.35 + 0.65 * fade;
+        blendshapes(u, v, bs);
+      }
+    }
+
+    base.set([(u - LM.center.x) * PX, -(v - LM.center.y) * PX, wz, size], p * 4);
+    color.set([rgb[0], rgb[1], rgb[2], alpha], p * 4);
+    writeDeltas(deltas, p, bs);
+  }
+
+  // extras: stacked on random real dots, hidden until disturbed
+  for (let p = M; p < n; p++) {
+    const q = (Math.random() * M) | 0;
+    base.set(base.subarray(q * 4, q * 4 + 4), p * 4);
+    color.set(color.subarray(q * 4, q * 4 + 3), p * 4);
+    color[p * 4 + 3] = 0;
+    deltas.set(deltas.subarray(q * SHAPES * 2, (q + 1) * SHAPES * 2), p * SHAPES * 2);
+  }
+
+  return { count: n, base, color, deltas, start: galaxy(n) };
 }

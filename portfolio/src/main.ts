@@ -3,7 +3,7 @@ import { createEngine } from './engine';
 import { U, type Engine } from './engine/types';
 import { EXPRESSION_NAMES, ExpressionAnimator, type ExpressionName } from './face/expressions';
 import { Mirror } from './face/mirror';
-import { sampleFace } from './face/sampler';
+import { loadPortrait, sampleFace, sampleSphereFace } from './face/sampler';
 import { clamp, damp, lerp } from './math';
 import { Camera } from './scene/camera';
 import { makeShape, type ShapeName } from './scene/shapes';
@@ -73,7 +73,17 @@ function toast(msg: string, ms = 1800) {
 // ---------------------------------------------------------------- boot
 const hasGPU = 'gpu' in navigator && params.get('backend') !== 'webgl2';
 const count = Number(params.get('n')) || (coarse ? 40000 : hasGPU ? 100000 : 70000);
-const data = await sampleFace(`${import.meta.env.BASE_URL}face.jpg`, { count });
+// two face styles from one portrait: dense photo particles, or a dotted 3D sphere
+type FaceStyle = 'photo' | 'sphere';
+const FACE_STYLES: FaceStyle[] = ['photo', 'sphere'];
+const storedStyle = (() => { try { return localStorage.getItem('face-style'); } catch { return null; } })();
+let faceStyle: FaceStyle = (params.get('face') ?? storedStyle) === 'sphere' ? 'sphere' : 'photo';
+const dots = Number(params.get('dots')) || (coarse ? 11000 : 17000);
+const portrait = await loadPortrait(`${import.meta.env.BASE_URL}face.jpg`);
+const faces: Partial<Record<FaceStyle, ReturnType<typeof sampleFace>>> = {};
+const faceData = (style: FaceStyle) =>
+  (faces[style] ??= style === 'sphere' ? sampleSphereFace(portrait, { count, dots }) : sampleFace(portrait, { count }));
+const data = faceData(faceStyle);
 if (reducedMotion) data.start.set(data.base);
 const engine: Engine | null = await createEngine($<HTMLCanvasElement>('gl'), data);
 
@@ -143,6 +153,20 @@ const api = {
     state.override = { face: 0, shape: name, expr: 'neutral', spin: name === 'terrain' || name === 'git' ? 0 : 0.35, scale: 1 };
     applyScene();
   },
+  faceStyles: FACE_STYLES as string[],
+  faceStyle(style?: string) {
+    const next = (style as FaceStyle) ?? FACE_STYLES[(FACE_STYLES.indexOf(faceStyle) + 1) % FACE_STYLES.length];
+    if (!FACE_STYLES.includes(next)) return faceStyle;
+    if (next !== faceStyle) {
+      faceStyle = next;
+      engine?.setFace(faceData(next));
+      try { localStorage.setItem('face-style', next); } catch { /* private mode */ }
+      if (!reducedMotion) state.turb = Math.max(state.turb, 0.5);
+    }
+    syncFaceButton();
+    if (activeScene().face < 0.5) api.face();
+    return faceStyle;
+  },
   face() {
     state.override = { ...SCENES[state.section], face: 1, shape: undefined };
     applyScene();
@@ -177,7 +201,7 @@ const api = {
     el?.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth' });
   },
   stats() {
-    return `${engine?.kind ?? 'no-gpu'} · ${data.count.toLocaleString()} particles · ${Math.round(state.fps)} fps`;
+    return `${engine?.kind ?? 'no-gpu'} · ${faceStyle} face · ${data.count.toLocaleString()} particles · ${Math.round(state.fps)} fps`;
   },
 };
 
@@ -197,6 +221,13 @@ exprWrap.addEventListener('click', (e) => {
   api.expression(b.dataset.expr as ExpressionName);
 });
 $('btn-theme').addEventListener('click', () => toast(`theme: ${api.theme()}`));
+function syncFaceButton() {
+  const b = $('btn-face');
+  b.textContent = `face: ${faceStyle}`;
+  b.setAttribute('aria-pressed', String(faceStyle === 'sphere'));
+}
+$('btn-face').addEventListener('click', () => toast(`face: ${api.faceStyle()}`));
+syncFaceButton();
 $('btn-term').addEventListener('click', () => term.toggle());
 $('term-close').addEventListener('click', () => term.toggle(false));
 $('btn-mirror').addEventListener('click', () => {
@@ -234,6 +265,7 @@ addEventListener('keydown', (e) => {
     if (activeScene().face < 0.5) api.face();
     api.expression(DOCK_EXPR[n - 1]);
   } else if (e.key === 't') toast(`theme: ${api.theme()}`);
+  else if (e.key === 'f') toast(`face: ${api.faceStyle()}`);
   else if (e.key === 'x') api.explode();
 });
 
@@ -241,6 +273,8 @@ addEventListener('keydown', (e) => {
 const uni = new Float32Array(U.FLOATS);
 // keep coverage constant: fewer particles -> bigger particles
 const particleSize = 0.0088 * Math.sqrt(100000 / data.count);
+// sphere dots: a fixed world-space dot radius, whatever the particle count
+const dotScale = 0.0072 / particleSize;
 let last = performance.now();
 let fpsAcc = 0, fpsFrames = 0, slowFor = 0;
 let shownExpr = '';
@@ -315,7 +349,9 @@ function frame(now: number) {
   const look = moving ? 1 : 0;
   expr.update(t, dt, gx * look, -gy * look);
   if (expr.current !== shownExpr) { shownExpr = expr.current; syncExprButtons(); }
-  const yaw = mirror.active ? expr.head[0] : expr.head[0] + gx * 0.32 * look;
+  // the sphere slowly turns on its own so its depth reads even without a cursor
+  const showcase = faceStyle === 'sphere' && !reducedMotion ? Math.sin(t * 0.35) * 0.45 * (1 - look) : 0;
+  const yaw = mirror.active ? expr.head[0] : expr.head[0] + gx * 0.32 * look + showcase;
   const pitch = mirror.active ? expr.head[1] : expr.head[1] - gy * 0.18 * look;
 
   // colours
@@ -348,6 +384,7 @@ function frame(now: number) {
   uni.set([...state.col.a, state.col.photo], U.colA);
   uni.set([...state.col.b, state.col.bright], U.colB);
   uni.set(expr.weights, U.weights);
+  uni.set([faceStyle === 'sphere' ? 1 : 0, dotScale, 0, 0], U.style);
   engine.frame(uni);
 }
 

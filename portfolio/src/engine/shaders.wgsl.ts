@@ -16,6 +16,7 @@ struct Uniforms {
   colA: vec4f,
   colB: vec4f,
   weights: array<vec4f, 3>,
+  style: vec4f,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -65,6 +66,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
   // --- 1. face target: rest pose + weighted blendshape deltas -------------
   let b = base[i];
+  let hw = mix(b.w, 1.0, u.style.x);
   var p = b.xyz;
   for (var k = 0u; k < K; k++) {
     let w = u.weights[k / 4u][k % 4u];
@@ -73,7 +75,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       p += vec3f(unpack2x16float(d.x), unpack2x16float(d.y).x) * w;
     }
   }
-  p = rotateHead(p, u.head.x * b.w, u.head.y * b.w, u.head.z * b.w);
+  p = rotateHead(p, u.head.x * hw, u.head.y * hw, u.head.z * hw);
   let faceT = p * u.faceXf.w + u.faceXf.xyz;
 
   // --- 2. morph target (spinning around Y) ---------------------------------
@@ -155,10 +157,21 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) i: u32) -> VOut {
   var col = mix(shapeCol, faceCol, faceMix);
   col += u.colB.rgb * min(length(V) * 0.12, 0.9);
   col *= u.colB.w;
-  let alpha = mix(1.0, c.a, faceMix);
+  let bw = base[i].w;
+  // dot mode: hidden spare particles sparkle while they move
+  let dotA = max(c.a, min(length(V) * 0.3, 0.85));
+  let alpha = mix(1.0, mix(c.a, dotA, u.style.x), faceMix);
+  if (alpha < 0.004) {
+    var o: VOut;
+    o.clip = vec4f(2.0, 2.0, 2.0, 1.0);
+    o.uv = vec2f(0.0);
+    o.col = vec4f(0.0);
+    return o;
+  }
 
   var clip = u.viewProj * vec4f(P, 1.0);
-  var px = max(u.sim2.w * (0.7 + seed * 0.6) * u.view.z * u.view.y * 0.5 / clip.w, 0.9);
+  let sizeK = mix(0.7 + seed * 0.6, mix(1.0, bw * u.style.y, faceMix), u.style.x);
+  var px = max(u.sim2.w * sizeK * u.view.z * u.view.y * 0.5 / clip.w, 0.9);
   px = min(px, 7.0 * u.view.y / 900.0);
   var corners = array<vec2f, 6>(
     vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),

@@ -87,6 +87,10 @@ export async function createWebGPUEngine(canvas: HTMLCanvasElement, data: Partic
     setMorph(target) {
       device.queue.writeBuffer(morphBuf, 0, target.buffer, target.byteOffset, target.byteLength);
     },
+    setFace(face) {
+      for (const [buf, src] of [[baseBuf, face.base], [colorBuf, face.color], [deltaBuf, face.deltas]] as const)
+        device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, src.byteLength);
+    },
     resize(w, h) {
       canvas.width = w;
       canvas.height = h;

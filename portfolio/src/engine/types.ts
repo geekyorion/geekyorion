@@ -25,7 +25,8 @@ export const U = {
   colA: 56, //     rgb theme A, w = photo amount (0 holo .. 1 photo)
   colB: 60, //     rgb theme B, w = brightness
   weights: 64, //  3 x vec4 = 12 blendshape weights
-  FLOATS: 76,
+  style: 76, //    x = dot mode (sphere face: base.w is dot size), y = dot size scale
+  FLOATS: 80,
 } as const;
 
 export interface ParticleData {
@@ -44,6 +45,8 @@ export interface Engine {
   readonly kind: 'webgpu' | 'webgl2';
   /** Upload a morph target: xyz = position, w = palette coordinate 0..1. */
   setMorph(target: Float32Array): void;
+  /** Swap the face (rest pose, colours, blendshapes) without touching particle state. */
+  setFace(data: Pick<ParticleData, 'base' | 'color' | 'deltas'>): void;
   resize(width: number, height: number): void;
   frame(uniforms: Float32Array): void;
   /** Test hook: render one frame offscreen and return its pixels. */

@@ -13,6 +13,15 @@ No three.js and no 3D models: a hand-written engine with two backends that share
 
 With no GPU at all, the page falls back to a static portrait, and all the content stays readable.
 
+## Two faces
+
+Toggle with the **face** chip in the dock, the `f` key, or `style sphere|photo` in the terminal. The choice is remembered, and `?face=sphere` links straight to the sphere face.
+
+- **photo**: ~100k particles importance-sampled from the portrait, as a dense and colourful point cloud.
+- **sphere**: the portrait projected onto a 3D ellipsoidal head covered in evenly spaced dots (a Fibonacci lattice), with gaps between them. Dots are halftone-sized by brightness, so the gaps draw the eyes, brows and hair. The back of the globe keeps faint shell dots, and the head slowly turns on its own to show its depth. Spare particles hide on real dots and only sparkle into view when the face gets scattered.
+
+Both styles share the same blendshapes, physics and scenes. Switching swaps the GPU buffers in place (`engine.setFace`), and the particles fly to their new positions.
+
 ## How the face works
 
 1. **Sampling** (`src/face/sampler.ts`): the portrait is flood-filled to remove the background, then importance-sampled so that edges (eyes, brows, lips, hair) get more particles than flat skin.
