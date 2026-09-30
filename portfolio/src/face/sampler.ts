@@ -1,5 +1,5 @@
 import { SHAPES, type ParticleData } from '../engine/types';
-import { BS, LM, PX } from './landmarks';
+import { BS, LM, PX, setLandmarks } from './landmarks';
 
 const gauss = (dx: number, dy: number, sx: number, sy: number) => Math.exp(-((dx * dx) / (sx * sx) + (dy * dy) / (sy * sy)));
 const superGauss = (dx: number, dy: number, sx: number, sy: number) => {
@@ -27,33 +27,6 @@ function toHalf(v: number) {
   return sign | (exp << 10) | (mant >>> 13);
 }
 const pack = (a: number, b: number) => (toHalf(a) | (toHalf(b) << 16)) >>> 0;
-
-/** Relief of the facial features (nose, sockets, lips, chin) in world units. */
-function features(u: number, v: number, lum: number) {
-  const faceMask = smooth(300, 330, u) * (1 - smooth(694, 724, u)) * (1 - smooth(640, 700, v));
-  return (
-    faceMask *
-    (0.2 * gauss(u - 512, v - 440, 26, 70) +
-      0.08 * gauss(u - LM.noseTip.x, v - LM.noseTip.y, 24, 18) -
-      0.07 * (gauss(u - LM.eyeL.x, v - LM.eyeL.y, 40, 24) + gauss(u - LM.eyeR.x, v - LM.eyeR.y, 40, 24)) +
-      0.05 * gauss(u - 512, v - 560, 70, 28) +
-      0.04 * gauss(u - 512, v - 662, 60, 30) +
-      (lum - 0.5) * 0.02)
-  );
-}
-
-/** Synthetic depth (world units) for a pixel of the portrait. */
-function depth(u: number, v: number, lum: number) {
-  const dx = (u - 512) / 215;
-  const dy = (v - 440) / 300;
-  const e = 1 - dx * dx - dy * dy;
-  const head = (e > 0 ? 0.62 * Math.sqrt(e) : 0) + features(u, v, lum);
-  const nx = (u - 512) / 150;
-  const neck = v > 560 ? 0.34 * Math.sqrt(Math.max(0, 1 - nx * nx)) - 0.06 : 0;
-  const sx = (u - 512) / 520;
-  const shirt = v > 700 ? 0.42 * Math.sqrt(Math.max(0, 1 - sx * sx)) - 0.2 : -1;
-  return Math.max(head, neck, shirt) - 0.3;
-}
 
 /** Blendshape deltas in pixel space (du, dv, dz) for one pixel. */
 function blendshapes(u: number, v: number, out: Float32Array) {
@@ -138,51 +111,75 @@ export interface FaceOptions {
   count: number;
 }
 
-export interface Portrait {
-  S: number;
-  scale: number;
-  px: Uint8ClampedArray;
-  lum: Float32Array;
-  bg: Uint8Array;
+/**
+ * A face baked by tools/bake_face.py: a shuffled pool of textured 3D points in
+ * the 1024 px reference frame. Depth is a consensus of MediaPipe face meshes
+ * from several photos; hair/neck use a proxy continuous with the mesh.
+ */
+export interface BakedFace {
+  n: number;
+  u: Float32Array;
+  v: Float32Array;
+  z: Float32Array;
+  rgb: Uint8Array;
+  /** 1 hair, 2 body skin, 3 face skin, 4 clothes */
+  cls: Uint8Array;
+  /** CSR grid over (u, v) for nearest-point lookups, 8 px cells */
+  cellStart: Uint32Array;
+  cellItems: Uint32Array;
 }
 
-/** Decode the portrait once; both face styles sample from it. */
-export async function loadPortrait(url: string): Promise<Portrait> {
-  const img = new Image();
-  img.src = url;
-  await img.decode();
-  const S = img.naturalWidth;
-  const scale = LM.size / S;
-  const cvs = document.createElement('canvas');
-  cvs.width = cvs.height = S;
-  const ctx = cvs.getContext('2d', { willReadFrequently: true })!;
-  ctx.drawImage(img, 0, 0);
-  const px = ctx.getImageData(0, 0, S, S).data;
+const CELL = 8;
+const GRID = 1024 / CELL;
 
-  const lum = new Float32Array(S * S);
-  for (let i = 0; i < S * S; i++) lum[i] = (0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2]) / 255;
+export async function loadBakedFace(url: string): Promise<BakedFace> {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const dv = new DataView(buf);
+  if (String.fromCharCode(...new Uint8Array(buf, 0, 4)) !== 'GFB1') throw new Error('bad face.bin');
+  const n = dv.getUint32(4, true);
+  const jsonLen = dv.getUint32(8, true);
+  setLandmarks(JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, jsonLen))));
+  let o = 12 + jsonLen;
+  o += (4 - (o % 4)) % 4;
+  const u16 = (k: number) => new Uint16Array(buf, o + k * n * 2, n);
+  const uq = u16(0), vq = u16(1), zq = new Int16Array(buf, o + 2 * n * 2, n);
+  const rgb = new Uint8Array(buf, o + 6 * n, n * 3);
+  const cls = new Uint8Array(buf, o + 9 * n, n);
+  const u = Float32Array.from(uq, (x) => x / 32);
+  const v = Float32Array.from(vq, (x) => x / 32);
+  const z = Float32Array.from(zq, (x) => x / 16);
 
-  // background: flood-fill near-white pixels from the image border
-  const bg = new Uint8Array(S * S);
-  const isWhite = (i: number) => {
-    const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
-    return r > 228 && g > 228 && b > 228 && Math.max(r, g, b) - Math.min(r, g, b) < 20;
-  };
-  const stack: number[] = [];
-  for (let x = 0; x < S; x++) stack.push(x, (S - 1) * S + x);
-  for (let y = 0; y < S; y++) stack.push(y * S, y * S + S - 1);
-  while (stack.length) {
-    const i = stack.pop()!;
-    if (bg[i] || !isWhite(i)) continue;
-    bg[i] = 1;
-    const x = i % S, y = (i / S) | 0;
-    if (x > 0) stack.push(i - 1);
-    if (x < S - 1) stack.push(i + 1);
-    if (y > 0) stack.push(i - S);
-    if (y < S - 1) stack.push(i + S);
-  }
-  return { S, scale, px, lum, bg };
+  // counting sort of points into grid cells
+  const cellOf = (i: number) => Math.min(GRID - 1, (v[i] / CELL) | 0) * GRID + Math.min(GRID - 1, (u[i] / CELL) | 0);
+  const cellStart = new Uint32Array(GRID * GRID + 1);
+  for (let i = 0; i < n; i++) cellStart[cellOf(i) + 1]++;
+  for (let c = 0; c < GRID * GRID; c++) cellStart[c + 1] += cellStart[c];
+  const fillPos = cellStart.slice(0, GRID * GRID);
+  const cellItems = new Uint32Array(n);
+  for (let i = 0; i < n; i++) cellItems[fillPos[cellOf(i)]++] = i;
+  return { n, u, v, z, rgb, cls, cellStart, cellItems };
 }
+
+/** Nearest baked point to (u, v) within `maxDist` px, or -1. */
+function nearest(face: BakedFace, u: number, v: number, maxDist: number) {
+  const cx = (u / CELL) | 0, cy = (v / CELL) | 0;
+  const r = Math.ceil(maxDist / CELL);
+  let best = -1, bestD = maxDist * maxDist;
+  for (let y = Math.max(0, cy - r); y <= Math.min(GRID - 1, cy + r); y++)
+    for (let x = Math.max(0, cx - r); x <= Math.min(GRID - 1, cx + r); x++) {
+      const c = y * GRID + x;
+      for (let k = face.cellStart[c]; k < face.cellStart[c + 1]; k++) {
+        const i = face.cellItems[k];
+        const d = (face.u[i] - u) ** 2 + (face.v[i] - v) ** 2;
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+  return best;
+}
+
+/** Depth of the nose tip in world units; the rest of the face sits behind it. */
+const NOSE_Z = 0.6;
+const worldZ = (z: number) => -(z - LM.zNose) * PX + NOSE_Z - 0.3;
 
 /** Lift shadows so dark hair still reads on a dark background. */
 const lift = (c: number) => Math.pow(c / 255, 0.8) * 0.92 + 0.05;
@@ -207,75 +204,37 @@ function galaxy(n: number) {
 }
 
 /**
- * Photo style. Importance-samples the portrait into particles: more particles on edges
- * (eyes, brows, lips, hair strands), fewer on flat skin, none on background.
+ * Photo style: the baked pool, as-is. Any prefix of the pool is an even
+ * subsample; beyond the pool, points are reused with a sub-pixel jitter.
  */
-export function sampleFace(portrait: Portrait, opts: FaceOptions): ParticleData {
-  const { S, scale, px, lum, bg } = portrait;
-  // importance weights
-  const weight = new Float32Array(S * S);
-  let total = 0;
-  for (let y = 1; y < S - 1; y++) {
-    const v = y * scale;
-    if (v > 860) break;
-    for (let x = 1; x < S - 1; x++) {
-      const i = y * S + x;
-      if (bg[i]) continue;
-      const gx = lum[i + 1] - lum[i - 1];
-      const gy = lum[i + S] - lum[i - S];
-      const edge = Math.min(1, Math.sqrt(gx * gx + gy * gy) * 6);
-      const fade = 1 - smooth(700, 860, v);
-      const w = (0.45 + edge * 1.6 + (1 - lum[i]) * 0.35) * (0.25 + 0.75 * fade);
-      weight[i] = w;
-      total += w;
-    }
-  }
-  const cdf = new Float32Array(S * S);
-  let acc = 0;
-  for (let i = 0; i < S * S; i++) {
-    acc += weight[i];
-    cdf[i] = acc;
-  }
-
+export function sampleFace(face: BakedFace, opts: FaceOptions): ParticleData {
   const n = opts.count;
   const base = new Float32Array(n * 4);
   const color = new Float32Array(n * 4);
   const deltas = new Uint32Array(n * SHAPES * 2);
-  const start = galaxy(n);
   const bs = new Float32Array(SHAPES * 3);
+  const neckTop = LM.chin.y - 20;
 
   for (let p = 0; p < n; p++) {
-    // stratified sampling keeps coverage even
-    const r = ((p + Math.random()) / n) * total;
-    let lo = 0, hi = cdf.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (cdf[mid] < r) lo = mid + 1;
-      else hi = mid;
-    }
-    const i = lo;
-    const x = (i % S) + Math.random();
-    const y = ((i / S) | 0) + Math.random();
-    const u = x * scale;
-    const v = y * scale;
-
-    const l = lum[i];
-    const z = depth(u, v, l) + (Math.random() - 0.5) * 0.015;
+    const q = p % face.n;
+    const j = p >= face.n ? 1.2 : 0;
+    const u = face.u[q] + (Math.random() - 0.5) * j;
+    const v = face.v[q] + (Math.random() - 0.5) * j;
+    const k = face.cls[q];
     base[p * 4] = (u - LM.center.x) * PX;
     base[p * 4 + 1] = -(v - LM.center.y) * PX;
-    base[p * 4 + 2] = z;
-    base[p * 4 + 3] = 1 - smooth(650, 790, v);
+    base[p * 4 + 2] = worldZ(face.z[q]);
+    base[p * 4 + 3] = k === 4 ? 0 : 1 - smooth(neckTop, neckTop + 140, v);
 
-    color[p * 4] = lift(px[i * 4]);
-    color[p * 4 + 1] = lift(px[i * 4 + 1]);
-    color[p * 4 + 2] = lift(px[i * 4 + 2]);
-    color[p * 4 + 3] = (1 - smooth(700, 860, v)) * 0.95;
+    color[p * 4] = lift(face.rgb[q * 3]);
+    color[p * 4 + 1] = lift(face.rgb[q * 3 + 1]);
+    color[p * 4 + 2] = lift(face.rgb[q * 3 + 2]);
+    color[p * 4 + 3] = (1 - smooth(720, 880, v)) * (k === 4 ? 0.4 : 0.95);
 
     blendshapes(u, v, bs);
     writeDeltas(deltas, p, bs);
   }
-
-  return { count: n, base, color, deltas, start };
+  return { count: n, base, color, deltas, start: galaxy(n) };
 }
 
 export interface SphereOptions extends FaceOptions {
@@ -290,14 +249,13 @@ export interface SphereOptions extends FaceOptions {
  *
  * base.w carries the dot size here (the whole sphere turns as one head).
  * Particles beyond `dots` are parked on real dots with alpha 0: invisible at
- * rest, they only show up once the pointer scatters the face.
+ * rest, they only sparkle into view while the face is being scattered.
  */
-export function sampleSphereFace(portrait: Portrait, opts: SphereOptions): ParticleData {
-  const { S, scale, px, lum, bg } = portrait;
+export function sampleSphereFace(face: BakedFace, opts: SphereOptions): ParticleData {
   const n = opts.count;
   const M = Math.min(opts.dots, n);
-  // ellipsoid in portrait pixels: centre + radii; depth radius in world units
-  const cu = 512, cv = 425, ru = 238, rv = 318, rz = 0.78;
+  // ellipsoid in reference pixels, centred on the face; depth radius in world units
+  const cu = 512, cv = LM.eyeL.y + 30, ru = 238, rv = 318, rz = 0.78;
   const golden = Math.PI * (3 - Math.sqrt(5));
 
   const base = new Float32Array(n * 4);
@@ -322,23 +280,20 @@ export function sampleSphereFace(portrait: Portrait, opts: SphereOptions): Parti
     bs.fill(0);
 
     if (z > 0) {
-      const ix = Math.min(S - 1, Math.max(0, Math.round(u / scale)));
-      const iy = Math.min(S - 1, Math.max(0, Math.round(v / scale)));
-      const i = iy * S + ix;
+      const i = nearest(face, u, v, 7);
       const fade = 1 - smooth(640, 740, v);
-      const sat = Math.max(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]) - Math.min(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]);
-      const whitish = lum[i] > 0.68 && sat < 38;
-      if (!bg[i] && !whitish && fade > 0.02) {
-        const l = lum[i];
-        // features push out along the surface, strongest facing the camera
-        wz += features(u, v, l) * z * 1.3;
-        rgb = [lift(px[i * 4]), lift(px[i * 4 + 1]), lift(px[i * 4 + 2])];
+      if (i >= 0 && face.cls[i] !== 4 && fade > 0.02) {
+        const px = [face.rgb[i * 3], face.rgb[i * 3 + 1], face.rgb[i * 3 + 2]];
+        const l = (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]) / 255;
+        // real relief from the baked depth, pressed onto the sphere
+        wz += clamp(worldZ(face.z[i]) - (NOSE_Z - 0.3) + 0.3, -0.1, 0.4) * z * 0.5;
+        rgb = px.map(lift);
         // halftone: bright skin -> big dots, dark eyes/brows/hair -> small dots, so the gaps draw the features
-        const t = smooth(0.12, 0.72, l);
-        size = (0.36 + 1.38 * t) * (0.65 + 0.35 * z);
+        const t = smooth(0.04, 0.62, l);
+        size = (0.5 + 1.15 * t) * (0.65 + 0.35 * z);
         // dark regions (hair, brows) get a cool slate tint so the hairline still reads
-        const dark = 1 - smooth(0.05, 0.3, l);
-        rgb = rgb.map((c, k) => (c * (0.75 + 0.5 * t)) * (1 - dark * 0.7) + [0.34, 0.42, 0.58][k] * dark * 0.7);
+        const dark = 1 - smooth(0.03, 0.22, l);
+        rgb = rgb.map((c, k) => c * (0.75 + 0.5 * t) * (1 - dark * 0.7) + [0.34, 0.42, 0.58][k] * dark * 0.7);
         alpha = 0.35 + 0.65 * fade;
         blendshapes(u, v, bs);
       }

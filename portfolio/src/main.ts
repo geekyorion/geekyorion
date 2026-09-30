@@ -3,7 +3,7 @@ import { createEngine } from './engine';
 import { U, type Engine } from './engine/types';
 import { EXPRESSION_NAMES, ExpressionAnimator, type ExpressionName } from './face/expressions';
 import { Mirror } from './face/mirror';
-import { loadPortrait, sampleFace, sampleSphereFace } from './face/sampler';
+import { loadBakedFace, sampleFace, sampleSphereFace } from './face/sampler';
 import { clamp, damp, lerp } from './math';
 import { Camera } from './scene/camera';
 import { makeShape, type ShapeName } from './scene/shapes';
@@ -79,7 +79,7 @@ const FACE_STYLES: FaceStyle[] = ['photo', 'sphere'];
 const storedStyle = (() => { try { return localStorage.getItem('face-style'); } catch { return null; } })();
 let faceStyle: FaceStyle = (params.get('face') ?? storedStyle) === 'sphere' ? 'sphere' : 'photo';
 const dots = Number(params.get('dots')) || (coarse ? 11000 : 17000);
-const portrait = await loadPortrait(`${import.meta.env.BASE_URL}face.jpg`);
+const portrait = await loadBakedFace(`${import.meta.env.BASE_URL}face.bin`);
 const faces: Partial<Record<FaceStyle, ReturnType<typeof sampleFace>>> = {};
 const faceData = (style: FaceStyle) =>
   (faces[style] ??= style === 'sphere' ? sampleSphereFace(portrait, { count, dots }) : sampleFace(portrait, { count }));
