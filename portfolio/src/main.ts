@@ -3,7 +3,7 @@ import { createEngine } from './engine';
 import { U, type Engine } from './engine/types';
 import { EXPRESSION_NAMES, ExpressionAnimator, type ExpressionName } from './face/expressions';
 import { Mirror } from './face/mirror';
-import { loadBakedFace, sampleFace, sampleSphereFace } from './face/sampler';
+import { headPivot, loadBakedFace, sampleFace, sampleSphereFace, SPHERE_Z } from './face/sampler';
 import { clamp, damp, lerp } from './math';
 import { Camera } from './scene/camera';
 import { makeShape, type ShapeName } from './scene/shapes';
@@ -52,6 +52,8 @@ const state = {
   offset: [0, 0, 0],
   scale: 1,
   pointer: { x: 0, y: 0, active: false, lastMove: -10, down: false, downAt: 0, inside: false },
+  /** drag-to-rotate: accumulated head yaw/pitch, eased back to rest after release */
+  drag: { lastX: 0, lastY: 0, moved: 0, yaw: 0, pitch: 0, releasedAt: -10, spinAt: -10 },
   shock: { at: [0, 0, 0], t: -10 },
   annoyance: 0,
   dpr: Math.min(devicePixelRatio, coarse ? 1.5 : 2),
@@ -72,7 +74,6 @@ function toast(msg: string, ms = 1800) {
 
 // ---------------------------------------------------------------- boot
 const hasGPU = 'gpu' in navigator && params.get('backend') !== 'webgl2';
-const count = Number(params.get('n')) || (coarse ? 40000 : hasGPU ? 100000 : 70000);
 // two face styles from one portrait: dense photo particles, or a dotted 3D sphere
 type FaceStyle = 'photo' | 'sphere';
 const FACE_STYLES: FaceStyle[] = ['photo', 'sphere'];
@@ -80,6 +81,8 @@ const storedStyle = (() => { try { return localStorage.getItem('face-style'); } 
 let faceStyle: FaceStyle = (params.get('face') ?? storedStyle) === 'sphere' ? 'sphere' : 'photo';
 const dots = Number(params.get('dots')) || (coarse ? 11000 : 17000);
 const portrait = await loadBakedFace(`${import.meta.env.BASE_URL}face.bin`);
+// WebGPU draws the whole baked head; WebGL2 and phones take an even prefix of it
+const count = Number(params.get('n')) || Math.min(portrait.n, coarse ? 45000 : hasGPU ? 150000 : 100000);
 const faces: Partial<Record<FaceStyle, ReturnType<typeof sampleFace>>> = {};
 const faceData = (style: FaceStyle) =>
   (faces[style] ??= style === 'sphere' ? sampleSphereFace(portrait, { count, dots }) : sampleFace(portrait, { count }));
@@ -176,6 +179,10 @@ const api = {
     state.theme = name ? THEMES.findIndex((t) => t.name === name) : (state.theme + 1) % THEMES.length;
     return THEMES[state.theme].name;
   },
+  spin() {
+    state.drag.spinAt = state.time;
+    if (activeScene().face < 0.5) api.face();
+  },
   explode() {
     state.shock = { at: [state.offset[0], state.offset[1], 0], t: state.time };
     state.turb = 2.2;
@@ -241,18 +248,40 @@ const setPointer = (e: PointerEvent) => {
   state.pointer.lastMove = state.time;
   state.pointer.inside = true;
 };
-addEventListener('pointermove', setPointer, { passive: true });
+const DRAG_THRESHOLD = 6;
+addEventListener('pointermove', (e) => {
+  setPointer(e);
+  const d = state.drag;
+  if (!state.pointer.down) return;
+  const dx = e.clientX - d.lastX, dy = e.clientY - d.lastY;
+  d.lastX = e.clientX;
+  d.lastY = e.clientY;
+  d.moved += Math.abs(dx) + Math.abs(dy);
+  // dragging spins the head: the whole thing is 3D, so look around it
+  if (d.moved > DRAG_THRESHOLD && activeScene().face > 0.5 && !mirror.active) {
+    d.yaw += dx * 0.009;
+    d.pitch = clamp(d.pitch + dy * 0.005, -0.55, 0.55);
+  }
+}, { passive: true });
 addEventListener('pointerdown', (e) => {
   setPointer(e);
   const t = e.target as HTMLElement;
   if (t.closest('a, button, input, .panel, .gitlog, .proj, .term, .dock')) return;
   state.pointer.down = true;
   state.pointer.downAt = state.time;
-  state.shock = { at: [...camera.hit], t: state.time };
-  const d = Math.hypot(camera.hit[0] - state.offset[0], camera.hit[1] - state.offset[1]);
-  if (activeScene().face > 0.5 && d < 1.2 * state.scale && !mirror.active) expr.set('surprised', 0.9, state.time);
+  Object.assign(state.drag, { lastX: e.clientX, lastY: e.clientY, moved: 0 });
 });
-addEventListener('pointerup', () => { state.pointer.down = false; });
+addEventListener('pointerup', () => {
+  if (!state.pointer.down) return;
+  state.pointer.down = false;
+  state.drag.releasedAt = state.time;
+  // a click (no drag) sends a shockwave
+  if (state.drag.moved < DRAG_THRESHOLD && state.time - state.pointer.downAt < 0.35) {
+    state.shock = { at: [...camera.hit], t: state.time };
+    const d = Math.hypot(camera.hit[0] - state.offset[0], camera.hit[1] - state.offset[1]);
+    if (activeScene().face > 0.5 && d < 1.2 * state.scale && !mirror.active) expr.set('surprised', 0.9, state.time);
+  }
+});
 addEventListener('pointercancel', () => { state.pointer.down = false; state.pointer.inside = false; });
 document.addEventListener('pointerleave', () => { state.pointer.inside = false; });
 
@@ -272,9 +301,10 @@ addEventListener('keydown', (e) => {
 // ---------------------------------------------------------------- frame loop
 const uni = new Float32Array(U.FLOATS);
 // keep coverage constant: fewer particles -> bigger particles
-const particleSize = 0.0088 * Math.sqrt(100000 / data.count);
+const particleSize = 0.0088 * Math.sqrt(100000 / data.count) * (Number(params.get('ps')) || 1);
 // sphere dots: a fixed world-space dot radius, whatever the particle count
 const dotScale = 0.0072 / particleSize;
+const pivot = headPivot();
 let last = performance.now();
 let fpsAcc = 0, fpsFrames = 0, slowFor = 0;
 let shownExpr = '';
@@ -351,8 +381,19 @@ function frame(now: number) {
   if (expr.current !== shownExpr) { shownExpr = expr.current; syncExprButtons(); }
   // the sphere slowly turns on its own so its depth reads even without a cursor
   const showcase = faceStyle === 'sphere' && !reducedMotion ? Math.sin(t * 0.35) * 0.45 * (1 - look) : 0;
-  const yaw = mirror.active ? expr.head[0] : expr.head[0] + gx * 0.32 * look + showcase;
-  const pitch = mirror.active ? expr.head[1] : expr.head[1] - gy * 0.18 * look;
+  // drag rotation eases back to rest a moment after release (the short way round)
+  const dr = state.drag;
+  const dragging = p.down && dr.moved > DRAG_THRESHOLD;
+  if (!dragging && t - dr.releasedAt > 2.2) {
+    dr.yaw = Math.atan2(Math.sin(dr.yaw), Math.cos(dr.yaw));
+    dr.yaw = lerp(dr.yaw, 0, damp(1.6, dt));
+    dr.pitch = lerp(dr.pitch, 0, damp(1.6, dt));
+  }
+  const spinT = clamp((t - dr.spinAt) / 3.2, 0, 1);
+  const spin = spinT > 0 && spinT < 1 ? (1 - Math.cos(spinT * Math.PI)) * Math.PI : 0;
+  const follow = dragging ? 0.3 : 1;
+  const yaw = mirror.active ? expr.head[0] : expr.head[0] + gx * 0.32 * look * follow + showcase + dr.yaw + spin;
+  const pitch = mirror.active ? expr.head[1] : expr.head[1] - gy * 0.18 * look * follow + dr.pitch;
 
   // colours
   const th = THEMES[state.theme];
@@ -366,8 +407,8 @@ function frame(now: number) {
   state.col.bright = lerp(state.col.bright, th.bright, kc);
 
   // pointer forces: repel while moving, a gravity well while held
-  const held = p.down && t - p.downAt > 0.25;
-  const strength = !moving ? 0 : held ? -26 : 22;
+  const held = p.down && !dragging && dr.moved < DRAG_THRESHOLD && t - p.downAt > 0.25;
+  const strength = !moving || dragging ? 0 : held ? -26 : 22;
   const radius = held ? 0.8 : 0.34;
 
   uni.set(camera.viewProj, U.viewProj);
@@ -379,12 +420,14 @@ function frame(now: number) {
   uni.set([state.offset[0], state.offset[1], 0, state.scale], U.faceXf);
   uni.set([state.offset[0], state.offset[1], 0, state.scale * (innerWidth / innerHeight > 1.15 ? 1 : 0.85)], U.shapeXf);
   uni.set([t, dt, state.faceMix > 0.5 ? 55 : 32, 8.5], U.sim);
-  uni.set([state.turb, state.spin, data.count, particleSize], U.sim2);
+  // the photo face needs slightly bigger particles for solid skin coverage
+  const faceBoost = faceStyle === 'photo' ? 1 + 0.35 * state.faceMix : 1;
+  uni.set([state.turb, state.spin, data.count, particleSize * faceBoost], U.sim2);
   uni.set([w, h, camera.proj11, state.col.additive], U.view);
   uni.set([...state.col.a, state.col.photo], U.colA);
   uni.set([...state.col.b, state.col.bright], U.colB);
   uni.set(expr.weights, U.weights);
-  uni.set([faceStyle === 'sphere' ? 1 : 0, dotScale, 0, 0], U.style);
+  uni.set([faceStyle === 'sphere' ? 1 : 0, dotScale, pivot[0], faceStyle === 'sphere' ? SPHERE_Z : pivot[1]], U.style);
   engine.frame(uni);
 }
 

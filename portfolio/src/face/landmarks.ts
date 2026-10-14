@@ -9,6 +9,8 @@ export interface Landmarks {
   mouth: P2; mouthL: P2; mouthR: P2; chin: P2;
   /** depth of the nose tip in reference pixels (baked faces only) */
   zNose: number;
+  /** depth of the skull's vertical axis (baked faces only) */
+  axisZ?: number;
 }
 
 /**

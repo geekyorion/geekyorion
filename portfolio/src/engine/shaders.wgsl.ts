@@ -38,7 +38,6 @@ ${UNIFORMS}
 @group(0) @binding(5) var<storage, read_write> vel: array<vec4f>;
 
 const K: u32 = ${SHAPES}u;
-const PIVOT = vec3f(0.0, -0.35, -0.25);
 
 fn flow(p: vec3f, t: f32) -> vec3f {
   return vec3f(
@@ -47,15 +46,22 @@ fn flow(p: vec3f, t: f32) -> vec3f {
     sin(p.x * 1.5 - t * 0.9) + sin(p.y * 2.7 + t * 0.6));
 }
 
+/** Rotation pivot: the skull axis (y, z from the style uniform). */
+fn pivot() -> vec3f { return vec3f(0.0, u.style.z, u.style.w); }
+
 fn rotateHead(p: vec3f, yaw: f32, pitch: f32, roll: f32) -> vec3f {
-  var q = p - PIVOT;
+  return rotateVec(p - pivot(), yaw, pitch, roll) + pivot();
+}
+
+fn rotateVec(v: vec3f, yaw: f32, pitch: f32, roll: f32) -> vec3f {
+  var q = v;
   let cy = cos(yaw); let sy = sin(yaw);
   q = vec3f(q.x * cy + q.z * sy, q.y, -q.x * sy + q.z * cy);
   let cp = cos(pitch); let sp = sin(pitch);
   q = vec3f(q.x, q.y * cp - q.z * sp, q.y * sp + q.z * cp);
   let cr = cos(roll); let sr = sin(roll);
   q = vec3f(q.x * cr - q.y * sr, q.x * sr + q.y * cr, q.z);
-  return q + PIVOT;
+  return q;
 }
 
 @compute @workgroup_size(256)
@@ -121,7 +127,20 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // --- 4. integrate (semi-implicit Euler, exponential damping) ------------
   V = (V + acc * dt) * exp(-u.sim.w * dt);
   P += V * dt;
-  pos[i] = vec4f(P, 1.0);
+  // back-face culling: settled points whose normal faces away from the camera fade out,
+  // so the back of the head never shows through the face. The normal rides in the
+  // spare halves of the first three blendshape slots.
+  let nrm = vec3f(unpack2x16float(deltas[i * K].y).y, unpack2x16float(deltas[i * K + 1u].y).y, unpack2x16float(deltas[i * K + 2u].y).y);
+  var vis = 1.0;
+  let nl = length(nrm);
+  if (nl > 2.0) {
+    vis = smoothstep(0.03, 0.2, u.weights[1].x); // mouth interior shows when the jaw opens
+  } else if (nl > 0.5) {
+    let rn = rotateVec(nrm, u.head.x * hw, u.head.y * hw, u.head.z * hw);
+    vis = smoothstep(-0.38, -0.02, dot(rn, normalize(u.rayO.xyz - P)));
+  }
+  let settled = 1.0 - smoothstep(0.03, 0.25, length(tgt - P));
+  pos[i] = vec4f(P, mix(1.0, vis, settled * u.head.w));
   vel[i] = vec4f(V, 0.0);
 }
 `;
@@ -160,7 +179,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) i: u32) -> VOut {
   let bw = base[i].w;
   // dot mode: hidden spare particles sparkle while they move
   let dotA = max(c.a, min(length(V) * 0.3, 0.85));
-  let alpha = mix(1.0, mix(c.a, dotA, u.style.x), faceMix);
+  let alpha = mix(1.0, mix(c.a, dotA, u.style.x), faceMix) * pos[i].w;
   if (alpha < 0.004) {
     var o: VOut;
     o.clip = vec4f(2.0, 2.0, 2.0, 1.0);

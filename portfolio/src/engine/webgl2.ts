@@ -53,7 +53,6 @@ uniform usampler2D uDeltas;
 layout(location = 0) out vec4 oPos;
 layout(location = 1) out vec4 oVel;
 
-const vec3 PIVOT = vec3(0.0, -0.35, -0.25);
 
 vec3 flow(vec3 p, float t) {
   return vec3(
@@ -62,15 +61,26 @@ vec3 flow(vec3 p, float t) {
     sin(p.x * 1.5 - t * 0.9) + sin(p.y * 2.7 + t * 0.6));
 }
 
-vec3 rotateHead(vec3 p, float yaw, float pitch, float roll) {
-  vec3 q = p - PIVOT;
+vec3 pivot() { return vec3(0.0, u.style.z, u.style.w); }
+
+vec3 rotateVec(vec3 v, float yaw, float pitch, float roll) {
+  vec3 q = v;
   float cy = cos(yaw), sy = sin(yaw);
   q = vec3(q.x * cy + q.z * sy, q.y, -q.x * sy + q.z * cy);
   float cp = cos(pitch), sp = sin(pitch);
   q = vec3(q.x, q.y * cp - q.z * sp, q.y * sp + q.z * cp);
   float cr = cos(roll), sr = sin(roll);
   q = vec3(q.x * cr - q.y * sr, q.x * sr + q.y * cr, q.z);
-  return q + PIVOT;
+  return q;
+}
+
+vec3 rotateHead(vec3 p, float yaw, float pitch, float roll) {
+  return rotateVec(p - pivot(), yaw, pitch, roll) + pivot();
+}
+
+float spareHalf(int i, int k) {
+  int j = i * ${SHAPES} + k;
+  return unpackHalf2x16(texelFetch(uDeltas, ivec2(j % ${DW}, j / ${DW}), 0).y).y;
 }
 
 void main() {
@@ -130,7 +140,18 @@ void main() {
 
   V = (V + acc * dt) * exp(-u.sim.w * dt);
   P += V * dt;
-  oPos = vec4(P, 1.0);
+  // back-face culling (see COMPUTE_WGSL)
+  vec3 nrm = vec3(spareHalf(i, 0), spareHalf(i, 1), spareHalf(i, 2));
+  float vis = 1.0;
+  float nl = length(nrm);
+  if (nl > 2.0) {
+    vis = smoothstep(0.03, 0.2, u.weights[1].x);
+  } else if (nl > 0.5) {
+    vec3 rn = rotateVec(nrm, u.head.x * hw, u.head.y * hw, u.head.z * hw);
+    vis = smoothstep(-0.38, -0.02, dot(rn, normalize(u.rayO.xyz - P)));
+  }
+  float settled = 1.0 - smoothstep(0.03, 0.25, length(tgt - P));
+  oPos = vec4(P, mix(1.0, vis, settled * u.head.w));
   oVel = vec4(V, 0.0);
 }`;
 
@@ -164,7 +185,7 @@ void main() {
   col *= u.colB.w;
   float bw = texelFetch(uBase, tc, 0).w;
   float dotA = max(c.a, min(length(V) * 0.3, 0.85));
-  vCol = vec4(col, mix(1.0, mix(c.a, dotA, u.style.x), faceMix));
+  vCol = vec4(col, mix(1.0, mix(c.a, dotA, u.style.x), faceMix) * texelFetch(uPos, tc, 0).w);
   if (vCol.a < 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
 
   vec4 clip = u.viewProj * vec4(P, 1.0);

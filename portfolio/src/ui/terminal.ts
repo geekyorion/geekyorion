@@ -14,6 +14,7 @@ export interface TermAPI {
   faceStyles: string[];
   themes: string[];
   explode(): void;
+  spin(): void;
   mirror(on: boolean): Promise<void>;
   goto(section: string): void;
   stats(): string;
@@ -132,6 +133,7 @@ export class Terminal {
           return [['ok', `theme: ${this.api.theme(name)}`]];
         },
       },
+      spin: { help: 'turn my head 360° (or drag the face)', run: () => { this.api.spin(); return [['ok', 'rotating the full 3D head']]; } },
       explode: { help: 'big bang', run: () => { this.api.explode(); return [['acc', '💥']]; } },
       mirror: {
         help: 'mirror [off]: drive my face with your webcam',

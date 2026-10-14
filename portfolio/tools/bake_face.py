@@ -72,6 +72,18 @@ img = np.asarray(ImageOps.exif_transpose(Image.open(glob.glob(f'private/{texture
 H, W = img.shape[:2]
 mask = np.asarray(Image.fromarray(mask_small).resize((W, H), Image.NEAREST))
 
+# close small gaps between hair and skin (background peeking between strands and cheek):
+# gap pixels become hair, coloured like their nearest real hair/skin pixel
+union = np.isin(mask, [1, 2, 3])
+gap = ndimage.binary_closing(union, iterations=8) & ~union
+if gap.any():
+    _, (iy, ix) = ndimage.distance_transform_edt(~union, return_indices=True)
+    mask = mask.copy()
+    img = img.copy()
+    mask[gap] = mask[iy[gap], ix[gap]]
+    img[gap] = img[iy[gap], ix[gap]]
+    print(f'filled {gap.sum()} gap pixels')
+
 s, R, t = umeyama(P_tex[STABLE], P_ref[STABLE])            # texture -> reference
 Rinv = R.T
 cons_tex = ((Rinv @ (consensus - t).T) / s).T                # consensus seen from the texture camera
@@ -105,60 +117,132 @@ bary2 = np.einsum('nij,nj->ni', T[:, :2], np.stack([xs[idx], ys[idx]], 1) - T[:,
 bary = np.concatenate([bary2, 1 - bary2.sum(1, keepdims=True)], 1)
 z_mesh[idx] = (bary * cons_tex[tri.simplices[simplex[idx]], 2]).sum(1)
 
-# proxy offset so the proxy meets the mesh at the hull boundary, then feather across it
+# first-pass proxy depth, only used to place pixels in the reference frame
 edge = inside & ~ndimage.binary_erosion(inside, iterations=4)
 offset = float(np.median(z_mesh[edge] - z_head[edge]))
 feather = ndimage.gaussian_filter(inside.astype(np.float32), float(hw * 0.12))
 cls = mask
-# hair: a bigger, rounder shell so hair outside the skull silhouette still curves back
-hx = (xs - cx) / (rx * 1.35)
-hy = (ys - cy) / (ry * 1.18)
-he = np.clip(1 - hx ** 2 - hy ** 2, 0, 1)
-z_hair = cz + offset * 0.5 - (rz * 1.05) * np.sqrt(he) - hw * 0.05
-z_proxy = np.where(cls == 1, np.minimum(z_hair, z_head + offset - hw * 0.05), z_head + offset)
-z_proxy = np.where(cls == 2, np.minimum(z_neck, z_head + offset), z_proxy)
-z_proxy = np.where(cls == 4, np.minimum(z_body, z_neck), z_proxy)
-z = np.where(inside, feather * z_mesh + (1 - feather) * z_proxy, z_proxy)
+z0 = np.where(inside, feather * z_mesh + (1 - feather) * (z_head + offset), z_head + offset)
 
-# ---------------------------------------------------------------- 3. into the reference frame
-pts = np.stack([xs, ys, z], -1).reshape(-1, 3)
-ref = (s * (R @ pts.T)).T + t
-U = ref[:, 0].reshape(H, W)
-V = ref[:, 1].reshape(H, W)
-Z = ref[:, 2].reshape(H, W)
+def to_ref(zmap):
+    pts = np.stack([xs, ys, zmap], -1).reshape(-1, 3)
+    ref = (s * (R @ pts.T)).T + t
+    return ref[:, 0].reshape(H, W), ref[:, 1].reshape(H, W), ref[:, 2].reshape(H, W)
+
+U, V, Z0 = to_ref(z0)
+Zmesh = to_ref(z_mesh)[2]
+
+# landmarks in the reference frame: texture x/y, consensus depth
+Lc = (s * (R @ np.stack([P_tex[:, 0], P_tex[:, 1], cons_tex[:, 2]], 1).T)).T + t
+hw_ref = np.linalg.norm(Lc[454, :2] - Lc[234, :2]) / 2
+
+# ---------------------------------------------------------------- 3. the lathe: a closed head from the silhouette
+# Each 2 px row of the reference frame is an ellipse: half-width a(v) from the
+# real outline (hair + skin), front radius from the face mesh, rounder back.
+body = np.isin(cls, [1, 2, 3]) & ~((cls == 2) & (np.abs(U - 512) > 190))
+ROW = 2
+rows = np.arange(0, 1024, ROW)
+vi = np.clip((V / ROW).astype(int), 0, len(rows) - 1)
+umin = np.full(len(rows), np.nan); umax = np.full(len(rows), np.nan)
+for r_ in range(len(rows)):
+    sel = body & (vi == r_)
+    if sel.sum() > 30:
+        uu = U[sel]
+        umin[r_], umax[r_] = np.percentile(uu, 1), np.percentile(uu, 99)
+valid = ~np.isnan(umin)
+top_row, bot_row = np.nonzero(valid)[0][[0, -1]]
+def fill_smooth(arr, sigma):
+    idx = np.arange(len(arr)); ok = ~np.isnan(arr)
+    out = np.interp(idx, idx[ok], arr[ok])
+    return ndimage.gaussian_filter1d(out, sigma)
+cxv = fill_smooth((umin + umax) / 2, 4)
+av = fill_smooth((umax - umin) / 2, 3)
+z_axis = float((Lc[234, 2] + Lc[454, 2]) / 2 + 0.25 * hw_ref)
+chin_v, neck_v = Lc[152, 1], Lc[152, 1] + 60
+
+# front radius: from the mesh where the face is, rounder elsewhere
+zf = np.full(len(rows), np.nan)
+for r_ in range(len(rows)):
+    sel = inside & (vi == r_) & (np.abs(U - cxv[r_]) < av[r_] * 0.35)
+    if sel.sum() > 20:
+        zf[r_] = np.percentile(Zmesh[sel], 50)
+bf_mesh = z_axis - zf
+bf_round = av * np.where(rows < chin_v, 1.0, 0.9)
+bf = np.where(np.isnan(bf_mesh), bf_round, np.maximum(bf_mesh, bf_round * 0.7))
+bf = ndimage.gaussian_filter1d(bf, 6)
+bb = av * np.where(rows < chin_v, 1.12, 0.92)
+bb = ndimage.gaussian_filter1d(bb, 6)
+
+def lathe_front_z(u, v):
+    r_ = np.clip((v / ROW).astype(int), 0, len(rows) - 1)
+    x = np.clip((u - cxv[r_]) / np.maximum(av[r_], 1), -1, 1)
+    return z_axis - bf[r_] * np.sqrt(1 - x ** 2)
+
+# final depth for photo pixels: mesh inside the hull, lathe outside, feathered
+Zl = lathe_front_z(U, V)
+Z = np.where(inside, feather * Zmesh + (1 - feather) * Zl, Zl)
+Z = np.where(cls == 4, np.minimum(Zl, z_axis - av[np.clip((V / ROW).astype(int), 0, len(rows) - 1)] * 0.6), Z)
 
 # which pixels become particles
 keep = np.isin(cls, [1, 2, 3, 4]) & (V < 880) & (V > 20)
 keep &= ~((cls == 2) & (np.abs(U - 512) > 190))     # arms
 keep &= ~((cls == 4) & (np.abs(U - 512) > 430))
 keep &= ~((cls == 4) & (V < 640))
+# grazing pixels at the silhouette are better served by the lathe sides
+xr = np.abs(U - cxv[np.clip((V / ROW).astype(int), 0, len(rows) - 1)]) / np.maximum(av[np.clip((V / ROW).astype(int), 0, len(rows) - 1)], 1)
+keep &= ~((cls != 3) & (xr > 0.97))
 
-# ---------------------------------------------------------------- 4. importance sampling
+# normals of the photo surface (tangents of the pixel -> reference map)
+tU = np.stack([np.gradient(U, axis=1), np.gradient(V, axis=1), np.gradient(Z, axis=1)], -1)
+tV = np.stack([np.gradient(U, axis=0), np.gradient(V, axis=0), np.gradient(Z, axis=0)], -1)
+Nmap = np.cross(tU, tV)
+Nmap /= np.linalg.norm(Nmap, axis=-1, keepdims=True) + 1e-9
+Nmap *= np.where(Nmap[..., 2:3] > 0, -1, 1)   # face the camera (-z)
+
+# ---------------------------------------------------------------- 4. importance sampling of the photo
 lum = img @ np.array([0.299, 0.587, 0.114], np.float32) / 255
 gy, gx = np.gradient(ndimage.gaussian_filter(lum, 1.2))
 edge_mag = np.clip(np.hypot(gx, gy) * 18, 0, 1)
 region = np.select([cls == 3, cls == 1, cls == 2, cls == 4], [1.25, 1.0, 0.8, 0.35], 0)
 fade = 1 - np.clip((V - 720) / 160, 0, 1)
-weight = np.where(keep, (1 + 1.1 * edge_mag) * region * (0.3 + 0.7 * fade), 0).astype(np.float64)
-flat = weight.ravel()
-cdf = np.cumsum(flat)
+# steep surfaces (nose sides, cheek edges) cover more 3D area per photo pixel: give them more points
+stretch = np.clip(1 / np.maximum(np.abs(Nmap[..., 2]), 1e-3), 1, 3)
+weight = np.where(keep, (1 + 1.1 * edge_mag) * region * (0.3 + 0.7 * fade) * stretch, 0).astype(np.float64)
 rng = np.random.default_rng(7)
-r = (np.arange(POOL) + rng.random(POOL)) / POOL * cdf[-1]
-pick = np.searchsorted(cdf, r)
-rng.shuffle(pick)
-py, px_ = np.divmod(pick, W)
+# Blue-noise sampling: expected counts per k x k cell, then 1D error diffusion along a
+# serpentine walk of the cells. Points end up evenly spaced, with no clumps or slits.
+kept = weight > 0
+k = max(2, int(round(np.sqrt(kept.sum() / POOL))))
+Hc, Wc = H // k, W // k
+cellw = weight[:Hc * k, :Wc * k].reshape(Hc, k, Wc, k).sum((1, 3))
+expected = cellw / cellw.sum() * POOL
+order = expected.copy()
+order[1::2] = order[1::2, ::-1]
+C = np.cumsum(order.ravel())
+counts = np.diff(np.floor(np.concatenate([[0.0], C]))).astype(int).reshape(Hc, Wc)
+counts[1::2] = counts[1::2, ::-1]
+cy_, cx_ = np.nonzero(counts)
+reps = counts[cy_, cx_]
+cy_, cx_ = np.repeat(cy_, reps), np.repeat(cx_, reps)
+M = len(cy_)
+py = cy_ * k + rng.integers(0, k, M)
+px_ = cx_ * k + rng.integers(0, k, M)
+for _ in range(8):  # re-draw points that fell on unused pixels inside an edge cell
+    bad = weight[py, px_] <= 0
+    if not bad.any():
+        break
+    py[bad] = cy_[bad] * k + rng.integers(0, k, bad.sum())
+    px_[bad] = cx_[bad] * k + rng.integers(0, k, bad.sum())
+ok = weight[py, px_] > 0
+py, px_ = py[ok], px_[ok]
+POOL = len(py)
+print(f'blue-noise pool: {POOL} points, cell {k}px')
 jx, jy = rng.random(POOL) - 0.5, rng.random(POOL) - 0.5
-
-# sub-pixel position through the same mapping (bilinear via neighbour deltas)
-def at(arr):
-    return arr[py, px_]
-dUx = np.gradient(U, axis=1)[py, px_]; dVx = np.gradient(V, axis=1)[py, px_]
-dUy = np.gradient(U, axis=0)[py, px_]; dVy = np.gradient(V, axis=0)[py, px_]
-u = at(U) + jx * dUx + jy * dUy
-v = at(V) + jx * dVx + jy * dVy
-zz = at(Z)
-# hair gets a little random depth so it reads as volume, not a sheet
-zz = zz + np.where(cls[py, px_] == 1, rng.normal(0, hw * s * 0.035, POOL), 0)
+at = lambda arr: arr[py, px_]
+u = at(U) + jx * at(np.gradient(U, axis=1)) + jy * at(np.gradient(U, axis=0))
+v = at(V) + jx * at(np.gradient(V, axis=1)) + jy * at(np.gradient(V, axis=0))
+zz = at(Z) + np.where(at(cls) == 1, rng.normal(0, hw_ref * 0.02, POOL), 0)
+nrm = at(Nmap)
 
 # exposure: match the median face-skin brightness of the reference portrait
 ref_img = np.asarray(Image.open(glob.glob(f'private/{REF}.*')[0]).convert('RGB'), np.float32)
@@ -166,12 +250,77 @@ _, _, ref_mask = load(REF)
 ref_skin = np.median(ref_img[np.asarray(Image.fromarray(ref_mask).resize(ref_img.shape[1::-1], Image.NEAREST)) == 3] @ [0.299, 0.587, 0.114])
 tex_skin = np.median(img[cls == 3] @ [0.299, 0.587, 0.114])
 gain = float(np.clip(ref_skin / tex_skin, 0.8, 1.8))
-print(f'exposure gain {gain:.2f} (skin {tex_skin:.0f} -> {ref_skin:.0f})')
-rgb = np.clip(img[py, px_] * gain, 0, 255).astype(np.uint8)
-kls = cls[py, px_].astype(np.uint8)
+print(f'exposure gain {gain:.2f}')
+rgb = np.clip(at(img) * gain, 0, 255)
+kls = at(cls).astype(np.uint8)
+
+# ---------------------------------------------------------------- 5. sides and back of the head
+# Strand colours come from the outer band of the photo on the same row and side.
+band = keep & np.isin(cls, [1, 2]) & (xr > 0.72)
+band_rows = {}
+bi = np.nonzero(band)
+for yy, xx in zip(*bi):
+    key = (int(V[yy, xx] / 8), U[yy, xx] > cxv[int(V[yy, xx] / ROW)])
+    band_rows.setdefault(key, []).append((yy, xx))
+density = POOL / float(((weight > 0) & (cls != 4)).sum() * s * s)   # points per reference px^2
+back_pts = []
+for r_ in range(top_row, min(bot_row, int(880 / ROW))):
+    vv = rows[r_]
+    a, rf, rb, cx_ = av[r_], bf[r_], bb[r_], cxv[r_]
+    if a < 4:
+        continue
+    th = np.linspace(np.radians(62), np.pi, 64)
+    rr = np.where(np.cos(th) > 0, rf, rb)
+    ds = np.hypot(a * np.cos(th), rr * np.sin(th)) * (th[1] - th[0])
+    count = rng.poisson(density * ds.sum() * ROW * 2 * 0.5)
+    for _ in range(count):
+        side = rng.random() < 0.5
+        t_ = rng.choice(th, p=ds / ds.sum()) + rng.normal(0, 0.01)
+        sgn = 1 if side else -1
+        rad = rf if np.cos(t_) > 0 else rb
+        x = cx_ + sgn * a * np.sin(t_)
+        z = z_axis - rad * np.cos(t_) + rng.normal(0, hw_ref * 0.015)
+        y = vv + rng.random() * ROW
+        lst = band_rows.get((int(y / 8), side)) or band_rows.get((int(y / 8) - 1, side)) or band_rows.get((int(y / 8) + 1, side))
+        if not lst:
+            continue
+        yy, xx = lst[rng.integers(len(lst))]
+        k = cls[yy, xx]
+        shade = 0.9 - 0.3 * max(0.0, (t_ - np.pi / 2) / (np.pi / 2))
+        c = np.clip(img[yy, xx] * gain * shade, 0, 255)
+        n = np.array([sgn * np.sin(t_) / a, 0, -np.cos(t_) / rad]); n /= np.linalg.norm(n)
+        back_pts.append((x, y, z, *c, 5 if k == 1 else 7, *n))
+back = np.array(back_pts, np.float64)
+print(f'lathe sides/back: {len(back)} points, axis z {z_axis:.0f}, rows {rows[top_row]}..{rows[bot_row]}')
+
+# ---------------------------------------------------------------- 6. mouth interior (shown when the jaw opens)
+mL, mR = Lc[61], Lc[291]
+mc = (Lc[13] + Lc[14]) / 2
+MI = 5200
+ang = rng.random(MI) * 2 * np.pi
+rad = np.sqrt(rng.random(MI))
+half = abs(mR[0] - mL[0]) / 2
+mu = mc[0] + np.cos(ang) * rad * (half + 8)
+mv = mc[1] + 10 + np.sin(ang) * rad * 34
+mz = np.full(MI, mc[2] + hw_ref * 0.12) + rng.normal(0, 1.5, MI)
+central = np.abs(mu - mc[0]) < half * 0.62
+upper_teeth = central & (mv > mc[1] - 10) & (mv < mc[1] + 3)
+lower_teeth = central & (mv > mc[1] + 5) & (mv < mc[1] + 12)
+mcol = np.select([upper_teeth[:, None], lower_teeth[:, None]], [[[156, 148, 138]], [[118, 110, 102]]], [[40, 13, 15]])
+mcol = mcol * (0.96 + 0.08 * rng.random((MI, 1)))
+# the cavity darkens towards the back of the throat
+mcol = np.where((upper_teeth | lower_teeth)[:, None], mcol, mcol * (1 - 0.5 * np.clip(rad[:, None], 0, 1)))
+interior = np.column_stack([mu, mv, mz, mcol, np.full(MI, 6), np.zeros((MI, 2)), -np.ones(MI)])
+
+# ---------------------------------------------------------------- assemble: interior first (drawn first), rest shuffled
+photo = np.column_stack([u, v, zz, rgb, kls, nrm])
+rest = np.concatenate([photo, back]) if len(back) else photo
+rest = rest[rng.permutation(len(rest))]
+allp = np.concatenate([interior, rest])
+N = len(allp)
 
 # ---------------------------------------------------------------- landmarks (texture features, reference frame)
-L = (s * (R @ P_tex.T)).T + t
+L = Lc
 pt = lambda i: {'x': round(float(L[i][0]), 1), 'y': round(float(L[i][1]), 1)}
 mid = lambda a, b: {'x': round(float((L[a][0] + L[b][0]) / 2), 1), 'y': round(float((L[a][1] + L[b][1]) / 2), 1)}
 lm = {
@@ -185,29 +334,37 @@ lm = {
     'mouth': mid(13, 14), 'mouthL': pt(61), 'mouthR': pt(291),
     'chin': pt(152),
     'zNose': round(float(L[1][2]), 1),
+    'axisZ': round(z_axis, 1),
     'source': {'photos': len(names), 'texture': 'selfie', 'depthSpread': round(float(spread), 2)},
 }
 print(json.dumps(lm))
+tri_ref = Delaunay(Lc[:, :2]).simplices.astype('<u2')
 
-# ---------------------------------------------------------------- write
+# ---------------------------------------------------------------- write (v2)
 js = json.dumps(lm).encode()
-head = b'GFB1' + struct.pack('<II', POOL, len(js)) + js
+head = b'GFB2' + struct.pack('<II', N, len(js)) + js
 head += b'\0' * (-len(head) % 4)
-body = (np.clip(u * 32, 0, 65535).astype('<u2').tobytes() + np.clip(v * 32, 0, 65535).astype('<u2').tobytes()
-        + np.clip(zz * 16, -32768, 32767).astype('<i2').tobytes() + rgb.tobytes() + kls.tobytes())
+head += Lc.astype('<f4').tobytes() + struct.pack('<I', len(tri_ref)) + tri_ref.tobytes()
+head += b'\0' * (-len(head) % 4)
+cu, cvv, czz = allp[:, 0], allp[:, 1], allp[:, 2]
+body = (np.clip(cu * 32, 0, 65535).astype('<u2').tobytes() + np.clip(cvv * 32, 0, 65535).astype('<u2').tobytes()
+        + np.clip(czz * 16, -32768, 32767).astype('<i2').tobytes() + np.clip(allp[:, 3:6], 0, 255).astype(np.uint8).tobytes()
+        + allp[:, 6].astype(np.uint8).tobytes() + np.clip(allp[:, 7:10] * 127, -127, 127).astype(np.int8).tobytes())
 open(out_path, 'wb').write(head + body)
-print(f'wrote {out_path}: {POOL} points, {len(head) + len(body)} bytes, u {u.min():.0f}..{u.max():.0f} v {v.min():.0f}..{v.max():.0f} z {zz.min():.0f}..{zz.max():.0f}')
+print(f'wrote {out_path}: {N} points ({MI} interior, {len(back)} lathe), {len(head) + len(body)} bytes, tris {len(tri_ref)}')
 
 if preview_path:
-    # private sanity check: front + side view of the baked points
-    canvas = np.zeros((1024, 2048, 3), np.uint8)
-    order = np.argsort(-zz)
-    for k in order:
-        x, y = int(u[k]), int(v[k])
-        if 0 <= x < 1024 and 0 <= y < 1024:
-            canvas[y, x] = rgb[k]
-    for k in np.argsort(u):
-        x, y = int(1536 + (zz[k] - lm['zNose']) * 1.0 - 150), int(v[k])
-        if 1024 <= x < 2048 and 0 <= y < 1024:
-            canvas[y, x] = rgb[k]
+    # private sanity check: front, side and back views of the baked points
+    canvas = np.zeros((1024, 3072, 3), np.uint8)
+    def splat(xs_, ys_, depth, ox):
+        for k in np.argsort(-depth):
+            x, y = int(xs_[k] + ox), int(ys_[k])
+            if ox <= x < ox + 1024 and 0 <= y < 1024:
+                canvas[y, x] = allp[k, 3:6]
+    vis = allp[:, 6] != 6
+    P3 = allp[vis]
+    allp = P3
+    splat(P3[:, 0], P3[:, 1], P3[:, 2], 0)                                          # front (camera at -z)
+    splat(512 + (P3[:, 2] - z_axis), P3[:, 1], P3[:, 0], 1024)                      # side, from screen-left
+    splat(1024 - P3[:, 0], P3[:, 1], -P3[:, 2], 2048)                               # back
     Image.fromarray(canvas).save(preview_path)
